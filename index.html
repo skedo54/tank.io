@@ -1,0 +1,202 @@
+<!--
+Multiplayer 3D Tank Game Starter
+Files included below: index.html (client), server.js (Node+Socket.io), package.json, README
+Place your captured folders next to index.html as: captured/models, captured/textures, captured/others
+If you uploaded actual GLTF/GLB models into captured/models, the client will attempt to load them. If they're missing, the client falls back to primitive tanks.
+
+Instructions:
+1. Put this project in a folder (e.g. C:\Temp\tankcap\)
+2. Ensure your captured folders are at C:\Temp\tankcap\captured\models etc.
+3. Install Node.js (v18+). Then run:
+   npm install
+   node server.js
+4. Open http://localhost:3000 in multiple browser windows to test multiplayer.
+
+-->
+
+<!-- ===================== index.html ===================== -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TankCap Multiplayer Starter</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;background:#111;color:#eee;font-family:Arial}
+    #ui{position:absolute;left:10px;top:10px;z-index:5;background:rgba(0,0,0,0.35);padding:10px;border-radius:6px}
+    #players{margin-top:6px}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div>WASD to move • Mouse to aim • Click to shoot</div>
+    <div>Ping: <span id="ping">-</span> • Health: <span id="hp">100</span></div>
+    <div id="players"></div>
+  </div>
+
+  <script type="module">
+  import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.156.0/build/three.module.js';
+  import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.156.0/examples/jsm/controls/OrbitControls.js';
+  import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.156.0/examples/jsm/loaders/GLTFLoader.js';
+
+  // Socket.io client (served from server)
+  const socketIoScript = document.createElement('script');
+  socketIoScript.src = '/socket.io/socket.io.js';
+  document.head.appendChild(socketIoScript);
+  socketIoScript.onload = () => { initMultiplayer(); };
+
+  // Utilities
+  const localId = Math.random().toString(36).substring(2,9);
+
+  let scene, camera, renderer, controls;
+  let player, enemies = {}, bullets = [];
+  let socket;
+  let loader = new GLTFLoader();
+
+  const playersUI = document.getElementById('players');
+
+  // Try loading user models from captured/models
+  const MODEL_PATHS = {
+    tank: 'captured/models/tank.glb',
+    turret: 'captured/models/turret.glb'
+  };
+
+  async function loadModelOrFallback(path, fallbackFactory){
+    try {
+      // try fetch to see if file exists
+      const res = await fetch(path, { method: 'HEAD' });
+      if (!res.ok) throw new Error('not found');
+      return await new Promise((resolve, reject)=> loader.load(path, g=> resolve(g.scene.clone()), e=>{}, err=>reject(err)));
+    } catch(e){
+      console.warn('Model not found:', path, 'using fallback');
+      return fallbackFactory();
+    }
+  }
+
+  function primitiveTankMesh(color=0x2b8cff){
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(6,2,9), new THREE.MeshStandardMaterial({color}));
+    body.position.y = 2; g.add(body);
+    const turret = new THREE.Mesh(new THREE.CylinderGeometry(2.6,2.2,1.6,12), new THREE.MeshStandardMaterial({color:0x223344}));
+    turret.rotation.x = Math.PI/2; turret.position.y = 3.2; g.add(turret);
+    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.8,8), new THREE.MeshStandardMaterial({color:0x111111}));
+    barrel.position.set(0,3.2,4.4); g.add(barrel);
+    return g;
+  }
+
+  // Build scene
+  function setupScene(){
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x111216, 0.002);
+    renderer = new THREE.WebGLRenderer({antialias:true}); renderer.setSize(innerWidth, innerHeight); renderer.shadowMap.enabled = true; document.body.appendChild(renderer.domElement);
+    camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000); camera.position.set(0,35,60);
+    controls = new OrbitControls(camera, renderer.domElement); controls.target.set(0,5,0); controls.enableDamping = true;
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6); hemi.position.set(0,200,0); scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(50,80,50); dir.castShadow = true; scene.add(dir);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(600,600), new THREE.MeshStandardMaterial({color:0x3b4a3b, roughness:0.9})); ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+  }
+
+  // Create local player (attempt to load model)
+  async function createLocalPlayer(){
+    const tankModel = await loadModelOrFallback(MODEL_PATHS.tank, ()=> primitiveTankMesh(0x2b8cff));
+    player = tankModel;
+    player.position.set((Math.random()-0.5)*50,0,(Math.random()-0.5)*50);
+    player.userData = { id: localId, hp: 100, turretPivot: player.getObjectByName('Turret') || player }; // simple
+    scene.add(player);
+  }
+
+  // Networking
+  function initMultiplayer(){
+    socket = io();
+    socket.on('connect', ()=>{
+      console.log('connected', socket.id);
+      socket.emit('join', { id: localId });
+    });
+
+    socket.on('state', msg => {
+      // full state sync (simple)
+      // msg.players: [{id,x,y,z,rotY,hp}]
+      // update or create remote players
+      const present = new Set();
+      for (const p of msg.players){
+        if (p.id === localId) continue;
+        present.add(p.id);
+        let ent = enemies[p.id];
+        if (!ent){
+          ent = primitiveTankMesh(0xcc2222);
+          scene.add(ent);
+          enemies[p.id] = ent;
+        }
+        ent.position.set(p.x,p.y,p.z);
+        ent.rotation.y = p.rotY;
+        ent.userData.hp = p.hp;
+      }
+      // remove missing
+      for (const id of Object.keys(enemies)) if (!present.has(id)) { scene.remove(enemies[id]); delete enemies[id]; }
+
+      // UI players list
+      playersUI.innerHTML = '<b>Players:</b> ' + msg.players.map(p=> p.id + (p.id===localId? ' (you)':'')).join(', ');
+    });
+
+    socket.on('bullet', b => {
+      // another client fired; spawn visual bullet
+      const mb = new THREE.Mesh(new THREE.SphereGeometry(0.3,8,8), new THREE.MeshStandardMaterial());
+      mb.position.set(b.x,b.y,b.z); mb.userData = { vel: new THREE.Vector3(b.vx,b.vy,b.vz) }; scene.add(mb); bullets.push(mb);
+    });
+
+    socket.on('ping', p => { document.getElementById('ping').innerText = Math.round(p); });
+  }
+
+  // Input
+  const keys = {};
+  window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+  window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+  const mouse = new THREE.Vector2();
+  window.addEventListener('pointermove', e => { mouse.x = (e.clientX/innerWidth)*2 -1; mouse.y = -(e.clientY/innerHeight)*2 +1; });
+  window.addEventListener('click', ()=> localShoot());
+
+  function localShoot(){
+    if (!player) return;
+    const barrelWorld = new THREE.Vector3(); player.localToWorld(barrelWorld.set(0,0,4));
+    const dir = new THREE.Vector3(0,0,1).applyQuaternion(player.quaternion).normalize();
+    // send to server
+    socket.emit('shoot', { x: barrelWorld.x, y: barrelWorld.y, z: barrelWorld.z, vx: dir.x*20, vy: dir.y*20, vz: dir.z*20 });
+    // spawn local bullet for responsiveness
+    const mb = new THREE.Mesh(new THREE.SphereGeometry(0.3,8,8), new THREE.MeshStandardMaterial()); mb.position.copy(barrelWorld); mb.userData = { vel: dir.clone().multiplyScalar(20) }; scene.add(mb); bullets.push(mb);
+  }
+
+  // Animate
+  const raycaster = new THREE.Raycaster(); const plane = new THREE.Plane(new THREE.Vector3(0,1,0),0);
+  const clock = new THREE.Clock();
+  function animate(){
+    const dt = Math.min(0.05, clock.getDelta());
+    if (player){
+      // movement
+      const speed = 10;
+      let move = new THREE.Vector3(); if (keys['w']) move.z -= 1; if (keys['s']) move.z += 1; if (keys['a']) player.rotation.y += 2*dt; if (keys['d']) player.rotation.y -= 2*dt;
+      if (move.lengthSq()>0){ move.normalize().applyQuaternion(player.quaternion); player.position.add(move.multiplyScalar(speed*dt)); }
+
+      // turret aim to mouse
+      raycaster.setFromCamera(mouse, camera); const p = new THREE.Vector3(); raycaster.ray.intersectPlane(plane, p); if (p) { /* could aim turret */ }
+
+      // send small updates to server
+      socket.emit('update', { id: localId, x: player.position.x, y: player.position.y, z: player.position.z, rotY: player.rotation.y, hp: player.userData.hp });
+    }
+
+    // bullets
+    for (let i=bullets.length-1;i>=0;i--){ const b = bullets[i]; b.position.add(b.userData.vel.clone().multiplyScalar(dt)); if (b.position.length()>1000){ scene.remove(b); bullets.splice(i,1); } }
+
+    controls.update(); renderer.render(scene, camera); requestAnimationFrame(animate);
+  }
+
+  // bootstrap
+  setupScene();
+  (async ()=>{ await createLocalPlayer(); animate(); })();
+
+  // resize
+  window.addEventListener('resize', ()=> { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+  </script>
+</body>
+</html>
