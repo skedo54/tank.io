@@ -1,7 +1,6 @@
 {
-  "name": "multiplayer-tank-game",
+  "name": "tankcap-final",
   "version": "1.0.0",
-  "description": "A simple multiplayer tank capture game using Node.js and Socket.IO",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
